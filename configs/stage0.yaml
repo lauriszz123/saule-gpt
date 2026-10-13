@@ -1,0 +1,160 @@
+# Stage 0 profile: the declared hardware, written down and validated.
+#
+# No training happens from this file. It exists so that the device profiles,
+# budgets and toolchain pins agreed at the Stage 0 gate are machine-checked
+# from the first commit rather than living in prose.
+#
+# The three declared targets each get their own sizes and budgets. `tier0_build`
+# is the only one marked trainable.
+
+profile_name: stage0
+stage: 0
+
+active_device: m1_air_16gb
+
+data:
+  root: data
+  saule:
+    repo: ../saule
+    binary: ../saule/target/release/saule
+    # Measured at Stage 0: the `saule` on PATH was 8c0eddf and disagreed with
+    # this commit on two example projects. The harness pins the binary it built.
+    git_sha: 9ce2dbb316d0ba5eaee731dceb2215051f6d6341
+    check_timeout_s: 10.0
+    run_timeout_s: 10.0
+    parallel_jobs: 8
+  # `saule disasm` is single-file only (measured: 113/113 single-file programs
+  # disassemble, 14/68 multi-file example files do), so bytecode is the dedup
+  # key where it exists and formatted text is the fallback where it does not.
+  dedup_on: bytecode_then_text
+  val_fraction: 0.05
+  seed: 1337
+  generators: []
+
+devices:
+  # -------------------------------------------------------------------
+  # TIER 0 -- the build machine. Training and synthesis only, never served.
+  # Budgets here are placeholders: nothing is served from this device, but
+  # the schema requires a budget, so these record "not a serving target".
+  # -------------------------------------------------------------------
+  - name: ryzen_rx6700xt
+    tier: tier0_build
+    trainable: true
+    notes: >-
+      Ryzen 5 7600 + RX 6700 XT 12 GB, gfx1031, Linux (elementary OS 8 /
+      noble). NOT probed at Stage 0 -- this session ran on macOS and cannot
+      reach it. Run scripts/probe_tier0.py there and replace these notes with
+      the measurement before any training is approved.
+    backend:
+      kind: scratch
+      precision: fp16
+      compile: false
+      model:
+        n_layers: 12
+        d_model: 768
+        n_heads: 12
+        n_kv_heads: 4
+        d_ff: 2048
+        vocab_size: 32768
+        max_seq_len: 1024
+    budget:
+      speech_to_response_s: 99.0
+      sustained_tokens_per_s: 1.0
+      visual_question_to_answer_s: 99.0
+      capture_hz: 1.0
+      detector_hz: 1.0
+      cold_start_s: 99.0
+      crash_recovery_s: 99.0
+      max_resident_memory_gb: 32.0
+
+  # -------------------------------------------------------------------
+  # TIER 1a -- the demo target. PROBED at Stage 0: M1, 8 cores, 16 GB.
+  # 16 GB confirmed by measurement, so a ~3B base at Q4 is the right size.
+  # 60% of 16 GB unified = 9.6 GB for the whole stack.
+  # -------------------------------------------------------------------
+  - name: m1_air_16gb
+    tier: tier1_laptop
+    trainable: false
+    notes: >-
+      MacBookAir10,1, Apple M1 (4P+4E), 16 GB unified, macOS 27.0.1.
+      Measured at Stage 0. Serving path is GGUF via llama.cpp with Metal;
+      MLX benchmarked against it at Stage 6.
+    backend:
+      kind: gguf
+      model_path: models/base-3b-Q4_K_M.gguf
+      quantization: Q4_K_M
+      n_ctx: 4096
+      n_gpu_layers: -1
+    modality:
+      mode: text
+      audio_encoder: whisper-tiny
+      vision_encoder: clip-vit-base-patch32
+      lazy_load: true
+    budget:
+      speech_to_response_s: 1.5
+      sustained_tokens_per_s: 20.0
+      visual_question_to_answer_s: 3.0
+      capture_hz: 30.0
+      detector_hz: 15.0
+      cold_start_s: 10.0
+      crash_recovery_s: 5.0
+      max_resident_memory_gb: 9.6
+
+  # -------------------------------------------------------------------
+  # TIER 1b -- required demo target. Maxwell GTX 960-class, 2-4 GB VRAM.
+  # Treated as CPU-class: the GPU is not counted on until Stage 0's probe
+  # shows llama.cpp's CUDA path beating plain CPU there.
+  # -------------------------------------------------------------------
+  - name: gtx960_laptop
+    tier: tier1_laptop
+    trainable: false
+    notes: >-
+      Intel CPU + GeForce GTX 960-class (Maxwell, no tensor cores, 2-4 GB).
+      NOT probed at Stage 0. Open question: does current PyTorch/CUDA still
+      cover compute capability 5.2, and does llama.cpp's CUDA path beat CPU?
+      Measure before sizing is fixed.
+    backend:
+      kind: gguf
+      model_path: models/base-1b-Q4_K_M.gguf
+      quantization: Q4_K_M
+      n_ctx: 2048
+      n_gpu_layers: 0
+    modality:
+      mode: text
+      lazy_load: true
+    budget:
+      speech_to_response_s: 1.5
+      sustained_tokens_per_s: 20.0
+      visual_question_to_answer_s: 3.0
+      capture_hz: 15.0
+      detector_hz: 5.0
+      cold_start_s: 10.0
+      crash_recovery_s: 5.0
+      max_resident_memory_gb: 6.0
+
+retrieval:
+  enabled: true
+  embedding_model: bge-small-en-v1.5
+  index_path: data/processed/index
+  top_k: 8
+  rerank_top_k: 3
+  mmap: true
+
+tools:
+  enabled: true
+  timeout_s: 10.0
+  domain_allowlist: []
+  fence_untrusted: true
+
+serve:
+  host: 127.0.0.1
+  port: 8000
+  stream: true
+  grammar_path: null
+  grammar_fallback_unconstrained: true
+  sampling:
+    temperature: 0.7
+    top_p: 0.95
+    min_p: 0.05
+    repetition_penalty: 1.1
+    max_new_tokens: 512

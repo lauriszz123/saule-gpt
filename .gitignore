@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# probe output is machine-specific; paste it into DECISIONS.md instead
+probe_tier0.json
+
+# bulk data and artifacts never enter git
+data/
+models/
+checkpoints/
+*.gguf
+*.bin
+*.safetensors

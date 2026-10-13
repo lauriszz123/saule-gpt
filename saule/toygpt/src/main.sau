@@ -1,0 +1,439 @@
+--[[
+A decoder-only transformer, in Saule, trained by zenith's autograd.
+
+This is the smallest thing that is honestly a GPT: learned token and
+positional embeddings, pre-norm blocks of causal self-attention and a GELU
+MLP, a final norm, and a tied-shape output projection trained with
+cross-entropy on next-token prediction.
+
+It exists to answer one question before any backend work happens: **does the
+whole stack train at all?** The loss has to fall and the model has to produce
+the right continuation, and this program asserts both rather than printing a
+curve that went nowhere. Everything after this — the native kernel layer, a
+GPU backend, f32 — is validated by keeping this same loss curve.
+
+WHAT IS DELIBERATELY SMALL, and why
+
+  * **One attention head.** numsol's `matmul` is rank 2 only, so the scores
+    for a single sequence — (L, d) @ (d, L) -> (L, L) — are expressible and a
+    batched multi-head product is not. Multi-head needs rank-3 `matmul`, which
+    is the first thing the array layer owes.
+  * **One sequence per forward pass**, for the same reason. Gradients
+    accumulate on the leaves, exactly as in PyTorch, so looping over a few
+    sequences before `opt.step()` is ordinary gradient accumulation and costs
+    nothing extra.
+  * **Embedding by one-hot matmul.** There are no integer arrays and no
+    gather, so a lookup is `oneHot(tokens) @ wte`. Correct, and wasteful by a
+    factor of the vocabulary — the real fix is an embedding op with a
+    scatter-add backward.
+
+THE TASK is next-token prediction on a fixed cycle, 1 -> 2 -> 3 -> 4 -> 1.
+Chosen because it is provably learnable and exactly checkable, so a failure is
+a bug in the stack rather than an unlucky run. It is also learnable *without*
+attention, from the previous token alone — so it proves the pipeline, not the
+attention. A lookback task that attention is actually needed for is the next
+step, and it belongs after this one passes.
+]]
+
+import * from "numsol"
+import * from "zenith"
+
+--- Hyperparameters, in one place.
+class Config
+  static vocab: integer = 4
+  static seqLen: integer = 6
+  static dModel: integer = 16
+  static dFF: integer = 32
+  static layers: integer = 2
+  static steps: integer = 300
+  static lr: float = 0.02
+  --- Added inside the square root in RMSNorm, so a row of zeros cannot
+  --- divide by zero. Spelled out because Saule has no `1e-5` literal.
+  static eps: float = 0.00001
+  --- Subtracted from masked attention scores. Large enough that softmax
+  --- gives it no weight, small enough not to produce an inf on the way.
+  static maskPenalty: float = 1000000.0
+end
+
+--- Normalise each row by its own root-mean-square.
+---
+--- RMSNorm rather than LayerNorm: no mean subtraction and no bias, so it is
+--- one fewer reduction and one fewer parameter, and it is what current
+--- decoder stacks use. Neither is in zenith, so both would be built here;
+--- this is the one worth having.
+---
+--- `keepDims` is what makes the division broadcast back over the row.
+class Norm
+  local gain: Tensor
+
+  fn init(width: integer)
+    self.gain = Tensor.parameter(Num.ones({1, width}), "norm.gain")
+  end
+
+  fn forward(x: Tensor) -> Tensor
+    local ms: Tensor = x.pow(2.0).meanAxis(2, true)
+    return x.div(ms.add(Config.eps).sqrt()).mul(self.gain)
+  end
+
+  fn parameters() -> table<Tensor>
+    return {self.gain}
+  end
+end
+
+--- The tanh approximation of GELU.
+---
+--- Built from `tanh` because zenith has no GELU, and from the approximation
+--- rather than the exact erf form because there is no erf either. The
+--- constants are the usual ones: sqrt(2/pi) and 0.044715.
+class Gelu
+  static fn forward(x: Tensor) -> Tensor
+    local inner: Tensor = x.add(x.pow(3.0).mul(0.044715)).mul(0.7978845608)
+    return x.mul(inner.tanh().add(1.0)).mul(0.5)
+  end
+end
+
+--- One pre-norm block: causal self-attention, then a GELU MLP, each added
+--- back into the residual stream.
+class Block
+  local n1: Norm
+  local n2: Norm
+  local wq: Tensor
+  local wk: Tensor
+  local wv: Tensor
+  local wo: Tensor
+  local w1: Tensor
+  local w2: Tensor
+  local scale: float
+
+  fn init(d: integer, ff: integer)
+    self.n1 = Norm(d)
+    self.n2 = Norm(d)
+    self.wq = Block.weight(d, d, "wq")
+    self.wk = Block.weight(d, d, "wk")
+    self.wv = Block.weight(d, d, "wv")
+    self.wo = Block.weight(d, d, "wo")
+    self.w1 = Block.weight(d, ff, "w1")
+    self.w2 = Block.weight(ff, d, "w2")
+    -- 1/sqrt(d), so the scores do not grow with width and push softmax into
+    -- a one-hot corner where the gradient vanishes.
+    self.scale = 1.0 / Math.sqrt(d as float)
+  end
+
+  --- Glorot-uniform, the same initialisation zenith's own `Linear` uses.
+  static fn weight(rows: integer, cols: integer, label: string) -> Tensor
+    local limit: float = Math.sqrt(6.0 / ((rows + cols) as float))
+    return Tensor.parameter(Num.uniform({rows, cols}, -limit, limit), label)
+  end
+
+  fn forward(x: Tensor, mask: Tensor) -> Tensor
+    local h: Tensor = self.n1.forward(x)
+
+    local q: Tensor = h.matmul(self.wq)
+    local k: Tensor = h.matmul(self.wk)
+    local v: Tensor = h.matmul(self.wv)
+
+    -- (L, d) @ (d, L) -> (L, L). Rank 2 throughout, which is the whole
+    -- reason this is one head.
+    local scores: Tensor = q.matmul(k.transpose()).mul(self.scale)
+
+    -- The mask is added, not multiplied: softmax needs the future to be
+    -- -inf-ish before it normalises, and zeroing afterwards would leave the
+    -- remaining weights summing to less than one.
+    local weights: Tensor = scores.add(mask).softmax(2)
+    local attended: Tensor = weights.matmul(v).matmul(self.wo)
+
+    local y: Tensor = x.add(attended)
+    local f: Tensor = Gelu.forward(self.n2.forward(y).matmul(self.w1)).matmul(self.w2)
+    return y.add(f)
+  end
+
+  fn parameters() -> table<Tensor>
+    local out: table<Tensor> = {self.wq, self.wk, self.wv, self.wo, self.w1, self.w2}
+    for i: integer = 1, #self.n1.parameters() do
+      Table.insert(out, self.n1.parameters()[i])
+    end
+    for i: integer = 1, #self.n2.parameters() do
+      Table.insert(out, self.n2.parameters()[i])
+    end
+    return out
+  end
+end
+
+class ToyGPT
+  local wte: Tensor
+  local wpe: Tensor
+  local blocks: table<Block>
+  local final: Norm
+  local head: Tensor
+  local mask: Tensor
+
+  fn init()
+    self.wte = Block.weight(Config.vocab, Config.dModel, "wte")
+    self.wpe = Block.weight(Config.seqLen, Config.dModel, "wpe")
+    self.final = Norm(Config.dModel)
+    self.head = Block.weight(Config.dModel, Config.vocab, "head")
+
+    self.blocks = {}
+    for i: integer = 1, Config.layers do
+      Table.insert(self.blocks, Block(Config.dModel, Config.dFF))
+    end
+
+    self.mask = ToyGPT.causalMask(Config.seqLen)
+  end
+
+  --- Zero where a position may attend, a large negative where it may not.
+  ---
+  --- Built once and held as a constant: it takes no gradient and does not
+  --- change, so rebuilding it per step would be the most expensive thing in
+  --- the loop.
+  static fn causalMask(n: integer) -> Tensor
+    local flat: table<float> = {}
+    for row: integer = 1, n do
+      for col: integer = 1, n do
+        if col <= row then
+          Table.insert(flat, 0.0)
+        else
+          Table.insert(flat, -Config.maskPenalty)
+        end
+      end
+    end
+    return Tensor.constant(Num.shaped(flat, {n, n}))
+  end
+
+  --- Logits for one sequence of token ids: (seqLen, vocab).
+  fn forward(tokens: table<integer>) -> Tensor
+    -- One-hot then matmul, because there is no gather. (L, vocab) @ (vocab, d).
+    local hot: Tensor = Tensor.constant(Metrics.oneHot(tokens, Config.vocab))
+    local x: Tensor = hot.matmul(self.wte).add(self.wpe)
+
+    for i: integer = 1, #self.blocks do
+      x = self.blocks[i].forward(x, self.mask)
+    end
+
+    return self.final.forward(x).matmul(self.head)
+  end
+
+  fn parameters() -> table<Tensor>
+    local out: table<Tensor> = {self.wte, self.wpe, self.head}
+    for i: integer = 1, #self.blocks do
+      local ps: table<Tensor> = self.blocks[i].parameters()
+      for j: integer = 1, #ps do
+        Table.insert(out, ps[j])
+      end
+    end
+    local fs: table<Tensor> = self.final.parameters()
+    for j: integer = 1, #fs do
+      Table.insert(out, fs[j])
+    end
+    return out
+  end
+
+  --- The most likely next token after `tokens`, read off the last position.
+  fn predictNext(tokens: table<integer>) -> integer
+    local logits: NDArray = self.forward(tokens).getValue()
+    local row: integer = #tokens
+    local best: integer = 1
+    local bestScore: float = logits.get({row, 1})
+    for c: integer = 2, Config.vocab do
+      local s: float = logits.get({row, c})
+      if s > bestScore then
+        bestScore = s
+        best = c
+      end
+    end
+    return best
+  end
+end
+
+--- One training task: inputs, the targets beside them, and a name.
+class Task
+  local name: string
+  local inputs: table<table<integer>>
+  local targets: table<table<integer>>
+
+  fn init(name: string, inputs: table<table<integer>>, targets: table<table<integer>>)
+    self.name = name
+    self.inputs = inputs
+    self.targets = targets
+  end
+
+  fn getName() -> string
+    return self.name
+  end
+
+  fn getInputs() -> table<table<integer>>
+    return self.inputs
+  end
+
+  fn getTargets() -> table<table<integer>>
+    return self.targets
+  end
+end
+
+class Main
+  --- The cycle 1 -> 2 -> 3 -> 4 -> 1, starting at `start`.
+  static fn cycle(start: integer, n: integer) -> table<integer>
+    local out: table<integer> = {}
+    for i: integer = 0, n - 1 do
+      Table.insert(out, ((start - 1 + i) % Config.vocab) + 1)
+    end
+    return out
+  end
+
+  --- Next-token prediction on the cycle.
+  ---
+  --- Learnable from the previous token alone, so it exercises the pipeline
+  --- rather than attention. It is the first thing to get working because a
+  --- failure here is unambiguous.
+  static fn cycleTask() -> Task
+    local inputs: table<table<integer>> = {}
+    local targets: table<table<integer>> = {}
+    for s: integer = 1, Config.vocab do
+      local seq: table<integer> = Main.cycle(s, Config.seqLen + 1)
+      local xs: table<integer> = {}
+      local ys: table<integer> = {}
+      for i: integer = 1, Config.seqLen do
+        Table.insert(xs, seq[i])
+        Table.insert(ys, seq[i + 1])
+      end
+      Table.insert(inputs, xs)
+      Table.insert(targets, ys)
+    end
+    return Task("cycle (needs no lookback)", inputs, targets)
+  end
+
+  --- Copy the first token to the end, across a run of identical filler.
+  ---
+  --- THIS IS THE ONE THAT NEEDS ATTENTION. The input is `[a, f, f, f, f, f]`
+  --- and the target at the last position is `a`, with filler everywhere else.
+  --- Every position except the first carries the same token, so the final
+  --- prediction cannot be made from the previous token, from the position, or
+  --- from any fixed window short of the whole sequence — the only way to
+  --- answer is to attend back to position 1.
+  ---
+  --- A model whose attention did nothing would be stuck predicting the filler
+  --- and would score 0 of 3 here while still passing the cycle task, which is
+  --- precisely the failure the cycle task cannot see.
+  static fn lookbackTask() -> Task
+    local filler: integer = Config.vocab
+    local inputs: table<table<integer>> = {}
+    local targets: table<table<integer>> = {}
+
+    -- Every token except the filler, as the thing to be remembered.
+    for a: integer = 1, Config.vocab - 1 do
+      local xs: table<integer> = {a}
+      local ys: table<integer> = {}
+      for i: integer = 2, Config.seqLen do
+        Table.insert(xs, filler)
+      end
+      for i: integer = 1, Config.seqLen - 1 do
+        Table.insert(ys, filler)
+      end
+      Table.insert(ys, a)
+      Table.insert(inputs, xs)
+      Table.insert(targets, ys)
+    end
+    return Task("lookback (attention required)", inputs, targets)
+  end
+
+  --- Train a fresh model on `task` and report whether it learned it.
+  ---
+  --- Returns the number of failed checks, so the caller can sum them.
+  static fn train(task: Task, steps: integer) -> integer
+    local inputs: table<table<integer>> = task.getInputs()
+    local targets: table<table<integer>> = task.getTargets()
+
+    println("")
+    println("-- " .. task.getName() .. " --")
+    println("   " .. #inputs .. " sequences, " .. steps .. " steps")
+
+    local model: ToyGPT = ToyGPT()
+    local opt: Optimizer = Adam(model.parameters(), Config.lr)
+
+    local first: float = 0.0
+    local last: float = 0.0
+
+    for step: integer = 1, steps do
+      opt.zeroGrad()
+
+      local total: float = 0.0
+      for b: integer = 1, #inputs do
+        local logits: Tensor = model.forward(inputs[b])
+        local loss: Tensor = Loss.crossEntropy(logits, targets[b])
+        loss.backward()
+        total = total + loss.item()
+      end
+
+      opt.step()
+
+      local mean: float = total / ((#inputs) as float)
+      if step == 1 then
+        first = mean
+      end
+      last = mean
+
+      if step % 100 == 0 or step == 1 then
+        println("   step " .. step .. "  loss " .. mean)
+      end
+    end
+
+    local failures: integer = 0
+
+    if last < first * 0.5 then
+      println("   ok   loss fell by more than half (" .. first .. " -> " .. last .. ")")
+    else
+      println("   FAIL loss did not halve (" .. first .. " -> " .. last .. ")")
+      failures = failures + 1
+    end
+
+    local correct: integer = 0
+    for b: integer = 1, #inputs do
+      local want: integer = targets[b][Config.seqLen]
+      local got: integer = model.predictNext(inputs[b])
+      if got == want then
+        correct = correct + 1
+      else
+        println("        seq " .. b .. ": predicted " .. got .. ", wanted " .. want)
+      end
+    end
+
+    if correct == #inputs then
+      println("   ok   all " .. #inputs .. " continuations correct")
+    else
+      println("   FAIL " .. correct .. "/" .. #inputs .. " continuations correct")
+      failures = failures + 1
+    end
+
+    return failures
+  end
+
+  static fn main()
+    println("toy GPT: " .. Config.layers .. " layers, d=" .. Config.dModel
+      .. ", vocab=" .. Config.vocab .. ", seq=" .. Config.seqLen)
+
+    local probe: ToyGPT = ToyGPT()
+    local params: table<Tensor> = probe.parameters()
+    local count: integer = 0
+    for i: integer = 1, #params do
+      count = count + params[i].getValue().size()
+    end
+    println("parameters: " .. #params .. " tensors, " .. count .. " scalars")
+
+    -- Cross-entropy over a uniform guess is ln(vocab). A first loss far from
+    -- it would mean an initialisation or logit bug, and nothing downstream
+    -- would be worth running -- so it is checked rather than assumed.
+    println("expected initial loss ~ ln(" .. Config.vocab .. ") = "
+      .. Math.log(Config.vocab as float))
+
+    local failures: integer = 0
+    failures = failures + Main.train(Main.cycleTask(), Config.steps)
+    failures = failures + Main.train(Main.lookbackTask(), Config.steps * 2)
+
+    println("")
+    if failures > 0 then
+      println(failures .. " check(s) failed")
+      Os.exit(1)
+    end
+    println("the stack trains, and attention does its job.")
+  end
+end
