@@ -369,7 +369,7 @@ Saule**, and prefer copying an existing idiom to inventing one.
 ### Correct shapes
 
 ```saule
-import * from "numsol"          -- module name is a QUOTED string
+from "numsol" import *          -- module name is a QUOTED string
 
 local a: integer = 1            -- `local`, with an explicit type
 println("a is " .. a)           -- `..` concatenates; print/println/printf all exist

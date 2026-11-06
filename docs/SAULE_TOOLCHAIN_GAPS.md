@@ -270,7 +270,7 @@ But any sample that `import`s is rejected before it runs, which excludes:
 
 - every multi-file synthetic project;
 - every doc-grounded task built on numsol or zenith, which are reachable only
-  by `import * from "numsol"`. The plan explicitly calls for those, and the
+  by `from "numsol" import *`. The plan explicitly calls for those, and the
   libraries are 3,059 lines of the best-annotated Saule available.
 
 ### The workaround, and its cost

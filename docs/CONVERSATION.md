@@ -2696,7 +2696,7 @@ It seeds `ModuleSeed::default()` and calls `saule_vm::compile` on one module. Th
 ## What it blocks
 
 1. **Multi-file synthetic samples.** A code assistant for a project-structured language has to generate projects, not just single files.
-2. **Anything using numsol or zenith** — reachable only via `import * from "numsol"`. That's 3,059 lines of the best-annotated Saule you have, and the plan explicitly calls for doc-grounded tasks built on both libraries.
+2. **Anything using numsol or zenith** — reachable only via `from "numsol" import *`. That's 3,059 lines of the best-annotated Saule you have, and the plan explicitly calls for doc-grounded tasks built on both libraries.
 
 ## The workaround, which I verified works
 
@@ -6270,7 +6270,7 @@ cargo build --release && cp target/release/libsaule_accel.dylib ~/.saule/native_
 ```
 
 ```saule
-import * from "accel"
+from "accel" import *
 
 local a: Arr = Accel.seeded({512, 512}, 1)
 local b: Arr = a.matmul(a.transposeLast()) * 2.0 + 1.0

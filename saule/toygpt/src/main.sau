@@ -35,8 +35,8 @@ attention. A lookback task that attention is actually needed for is the next
 step, and it belongs after this one passes.
 ]]
 
-import * from "numsol"
-import * from "zenith"
+from "numsol" import *
+from "zenith" import *
 
 --- Hyperparameters, in one place.
 class Config
